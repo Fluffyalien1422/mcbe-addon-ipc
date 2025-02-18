@@ -1,4 +1,5 @@
 import {
+  InternalInvokeOptions,
   InvokeOptions,
   IpcTypeFlag,
   ScriptEventListener,
@@ -8,12 +9,6 @@ import {
 import { send, sendInternal, sendStream, sendStreamInternal } from "./send.js";
 import { Failure } from "./failure.js";
 import { ScriptEventCommandMessageAfterEvent, system } from "@minecraft/server";
-import {
-  invoke,
-  invokeInternal,
-  invokeStream,
-  invokeStreamInternal,
-} from "./invoke.js";
 import { MAX_MESSAGE_LENGTH, MAX_ROUTER_UID_LENGTH } from "./constants.js";
 
 /**
@@ -147,7 +142,13 @@ export class Router {
    * @throws Throws if the message is too long.
    */
   invoke(options: InvokeOptions): Promise<SerializableValue> {
-    return invoke(options, this, this.generateListenerUid());
+    return this.invokeInternal(
+      {
+        ...options,
+        payload: JSON.stringify(options.payload),
+      },
+      this.generateListenerUid()
+    );
   }
 
   /**
@@ -157,9 +158,11 @@ export class Router {
    * @throws Throws if the message is too long.
    */
   invokeStream(options: InvokeOptions): Promise<SerializableValue> {
-    return invokeStream(
-      options,
-      this,
+    return this.invokeStreamInternal(
+      {
+        ...options,
+        payload: JSON.stringify(options.payload),
+      },
       this.generateListenerUid(),
       this.generateStreamUid()
     );
@@ -179,18 +182,88 @@ export class Router {
       serialized.length + responseListenerId.length + 1;
 
     if (actualPayloadLength > MAX_MESSAGE_LENGTH) {
-      return invokeStreamInternal(
+      return this.invokeStreamInternal(
         { ...options, payload: serialized },
-        this,
         responseListenerId,
         this.generateStreamUid()
       );
     }
-    return invokeInternal(
+    return this.invokeInternal(
       { ...options, payload: serialized },
-      this,
       responseListenerId
     );
+  }
+
+  private setListener(event: string, callback: ScriptEventListener): void {
+    this.listeners.set(event, callback);
+  }
+
+  private invokeInternal(
+    options: InternalInvokeOptions,
+    responseListenerId: string
+  ): Promise<SerializableValue> {
+    return new Promise((resolve, reject) => {
+      const timeoutId = system.runTimeout(() => {
+        this.removeListener(responseListenerId);
+        reject(new Error(`Invoke '${options.event}' timed out.`));
+      }, 20);
+
+      this.setListener(responseListenerId, (payload) => {
+        this.removeListener(responseListenerId);
+        system.clearRun(timeoutId);
+
+        if (payload instanceof Failure && options.throwFailures) {
+          reject(payload);
+        } else {
+          resolve(payload);
+        }
+
+        return null;
+      });
+
+      sendInternal(IpcTypeFlag.Invoke, {
+        ...options,
+        payload: `${responseListenerId} ${options.payload}`,
+      });
+    });
+  }
+
+  private invokeStreamInternal(
+    options: InternalInvokeOptions,
+    responseListenerId: string,
+    streamId: string
+  ): Promise<SerializableValue> {
+    let timeoutId: number | undefined;
+
+    return new Promise((resolve, reject) => {
+      this.setListener(responseListenerId, (payload) => {
+        this.removeListener(responseListenerId);
+        if (timeoutId !== undefined) {
+          system.clearRun(timeoutId);
+        }
+
+        if (payload instanceof Failure && options.throwFailures) {
+          reject(payload);
+        } else {
+          resolve(payload);
+        }
+
+        return null;
+      });
+
+      void sendStreamInternal(
+        IpcTypeFlag.InvokeStream,
+        options.event,
+        `${responseListenerId} ${options.payload}`,
+        streamId,
+        options.force
+      ).finally(() => {
+        timeoutId = system.runTimeout(() => {
+          this.removeListener(responseListenerId);
+          reject(new Error(`Invoke '${options.event}' timed out.`));
+        }, 20);
+      });
+    });
   }
 
   private generateListenerUid(): string {
