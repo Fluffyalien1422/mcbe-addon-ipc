@@ -1,7 +1,7 @@
 {
   "name": "mcbe-addon-ipc",
   "description": "IPC utilities for Minecraft Bedrock add-ons",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "author": "Fluffyalien",
   "repository": {
     "type": "git",
